@@ -40,7 +40,7 @@ func (en *Engines) WriteRaft(wb *WriteBatch) error {
 func (en *Engines) Close() error {
 	dbs := []*badger.DB{en.Kv, en.Raft}
 	for _, db := range dbs {
-		if db == nil {
+		if db == nil { //db可以为nil
 			continue
 		}
 		if err := db.Close(); err != nil {
