@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -183,6 +184,44 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	//Raft中有两种tick, 一种是heartbeat, 一种是electionElapsed，
+	//heartbeatElapsed只有在r为leader时有效,每达到一次heartbeatTimeout就向follower发送一次heartbeat
+	//electionElapsed无论对谁都有效。对于leader和candidate,每间隔一个electionTimeout就清空
+	//对于follower,如果收到了leader的消息就清空,否则,若达到了electionTimeout,说明leader寄了,转化为candidate参与选举
+	//此时记得重置elctionTimeout
+
+	// heartbeat interval, should send
+	//heartbeatTimeout int
+	// baseline of election interval
+	//electionTimeout int
+	// number of ticks since it reached last heartbeatTimeout.
+	// only leader keeps heartbeatElapsed.
+	//heartbeatElapsed int
+	// Ticks since it reached last electionTimeout when it is leader or candidate.
+	// Number of ticks since it reached last electionTimeout or received a
+	// valid message from current leader when it is a follower.
+	//electionElapsed int
+	r.electionElapsed++
+	if r.State == StateLeader { //若为领导人，发送heartbeat
+		r.heartbeatElapsed++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			r.sendHeartbeat(uint64(eraftpb.MessageType_MsgHeartbeat)) //如何调用protobuf的消息类型？查一查
+		}
+		//leader宕机后变为follower或许应该在异步接受到heartbeat后处理？
+	}
+	if r.State == StateFollower {
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			//这个地方按理说应该重置electionTimeout，但我先不写————————————————————
+			r.becomeCandidate()
+		}
+		//follower接受heartbeat后清空electionElapsed应该也是异步进行的？
+	}
+	if r.State == StateCandidate {
+
+	}
+
 }
 
 // becomeFollower transform this peer's state to Follower
