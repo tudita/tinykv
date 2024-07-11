@@ -32,14 +32,13 @@ func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kv
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using Storage.Modify to store data to be modified
+	//函数中不需要调用server.storage.start和close
 	put := storage.Put{
 		Key:   req.GetKey(),
 		Value: req.GetValue(),
 		Cf:    req.GetCf(),
 	}
 	mod := storage.Modify{Data: put}
-	server.storage.Start()
-	defer server.storage.Stop()
 	res := &kvrpcpb.RawPutResponse{}
 	err := server.storage.Write(req.Context, []storage.Modify{mod})
 	if err != nil {
@@ -53,15 +52,17 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 	// Your Code Here (1).
 	// Hint: Consider using Storage.Modify to store data to be deleted
 
-	del := storage.Put{
+	del := storage.Delete{
 		Key: req.GetKey(),
 		Cf:  req.GetCf(),
 	}
 	mod := storage.Modify{Data: del}
-	server.storage.Start()
-	defer server.storage.Stop()
 	err := server.storage.Write(req.Context, []storage.Modify{mod})
-	return nil, err
+	res := &kvrpcpb.RawDeleteResponse{}
+	if err != nil {
+		res.Error = err.Error()
+	}
+	return res, err
 
 }
 
@@ -70,20 +71,18 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	// Your Code Here (1).
 	// Hint: Consider using reader.IterCF
 
-	server.storage.Start()
-	defer server.storage.Stop()
-	reader, _ := server.storage.Reader(req.Context)
-	iter := reader.IterCF(req.Cf)
-	iter.Seek(req.StartKey)
+	reader, error := server.storage.Reader(req.GetContext())
+	iter := reader.IterCF(req.GetCf())
+	iter.Seek(req.GetStartKey())
 	var pairs []*kvrpcpb.KvPair
-	for i := 0; i < int(req.Limit) && iter.Valid(); i++ {
+	for i := 0; i < int(req.GetLimit()) && iter.Valid(); i++ {
 		item := iter.Item()
 		value, _ := item.Value()
 		pairs = append(pairs, &kvrpcpb.KvPair{Key: item.Key(), Value: value})
+		iter.Next()
 	}
-
 	return &kvrpcpb.RawScanResponse{
 		Kvs: pairs,
-	}, nil
+	}, error
 
 }
