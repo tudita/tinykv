@@ -166,19 +166,80 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	prs := make(map[uint64]*Progress)
+	for _, peer := range c.peers {
+		prs[peer] = new(Progress)
+	}
+	return &Raft{
+		RaftLog:          newLog(c.Storage),
+		id:               c.ID,
+		Prs:              prs,
+		State:            StateFollower,
+		heartbeatElapsed: c.HeartbeatTick,
+		electionElapsed:  c.ElectionTick,
+	}
+	//利用config中的信息初始化raft结构体
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	Ents := r.RaftLog.allEntries()
+	var ents []*eraftpb.Entry
+	next := r.Prs[to].Next
+	for i := r.Prs[to].Next; i <= r.RaftLog.LastIndex(); i++ {
+		ents = append(ents, &Ents[i])
+	}
+	message := eraftpb.Message{
+		MsgType: eraftpb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,                            //发送者ID(leader)
+		Term:    r.Term,                          //发送者任期(leader)
+		LogTerm: r.RaftLog.entries[next-1].Term,  //紧邻着上一个日志条目的任期
+		Index:   r.RaftLog.entries[next-1].Index, //紧邻着上一个日志条目的索引
+		Commit:  r.RaftLog.committed,             //current commit index
+		Entries: ents,
+	}
+	r.msgs = append(r.msgs, message)
+	return true
+	//什么情况下会sent失败？
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	next := r.Prs[to].Next
+	message := eraftpb.Message{
+		MsgType: eraftpb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,                            //发送者ID(leader)
+		Term:    r.Term,                          //发送者任期(leader)
+		LogTerm: r.RaftLog.entries[next-1].Term,  //紧邻着上一个日志条目的任期
+		Index:   r.RaftLog.entries[next-1].Index, //紧邻着上一个日志条目的索引
+		Commit:  r.RaftLog.committed,             //current commit index
+	}
+	r.msgs = append(r.msgs, message)
+}
+
+func (r *Raft) sendRequestVote(to uint64) {
+	// Your Code Here (2A).
+	message := eraftpb.Message{
+		MsgType: eraftpb.MessageType_MsgRequestVote,
+		To:      to,
+		From:    r.id,                                           //候选人id
+		Term:    r.Term,                                         //候选人任期号
+		Index:   r.RaftLog.entries[r.RaftLog.LastIndex()].Index, //最后一个日志条目的索引
+		LogTerm: r.RaftLog.entries[r.RaftLog.LastIndex()].Term,  //最后一个日志条目的任期
+	}
+	r.msgs = append(r.msgs, message)
+}
+func (r *Raft) sendRequestVote2All() {
+	for id := range r.Prs {
+		if id != r.id {
+			r.sendRequestVote(id)
+		}
+	}
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -189,37 +250,37 @@ func (r *Raft) tick() {
 	//electionElapsed无论对谁都有效。对于leader和candidate,每间隔一个electionTimeout就清空
 	//对于follower,如果收到了leader的消息就清空,否则,若达到了electionTimeout,说明leader寄了,转化为candidate参与选举
 	//此时记得重置elctionTimeout
-
-	// heartbeat interval, should send
-	//heartbeatTimeout int
-	// baseline of election interval
-	//electionTimeout int
-	// number of ticks since it reached last heartbeatTimeout.
-	// only leader keeps heartbeatElapsed.
-	//heartbeatElapsed int
-	// Ticks since it reached last electionTimeout when it is leader or candidate.
-	// Number of ticks since it reached last electionTimeout or received a
-	// valid message from current leader when it is a follower.
-	//electionElapsed int
 	r.electionElapsed++
 	if r.State == StateLeader { //若为领导人，发送heartbeat
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
-			r.sendHeartbeat(uint64(eraftpb.MessageType_MsgHeartbeat)) //如何调用protobuf的消息类型？查一查
+			for id := range r.Prs {
+				if id != r.id {
+					r.sendHeartbeat(id)
+				}
+			}
 		}
 		//leader宕机后变为follower或许应该在异步接受到heartbeat后处理？
 	}
 	if r.State == StateFollower {
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
-			//这个地方按理说应该重置electionTimeout，但我先不写————————————————————
+			//这个地方按理说应该随机化electionTimeout，但我先不写————————————————————
 			r.becomeCandidate()
+			//发起投票请求
+			r.sendRequestVote2All()
 		}
 		//follower接受heartbeat后清空electionElapsed应该也是异步进行的？
 	}
 	if r.State == StateCandidate {
+		//选票瓜分后需要随机重置超时时间,先不写————————————————————
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			//随机
+			//重新发起选举
 
+		}
 	}
 
 }
@@ -246,8 +307,14 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		}
 	case StateCandidate:
+		switch m.MsgType {
+		}
 	case StateLeader:
+		switch m.MsgType {
+		}
 	}
 	return nil
 }
