@@ -36,6 +36,7 @@ import (
 
 func TestFollowerUpdateTermFromMessage2AA(t *testing.T) {
 	testUpdateTermFromMessage(t, StateFollower)
+
 }
 func TestCandidateUpdateTermFromMessage2AA(t *testing.T) {
 	testUpdateTermFromMessage(t, StateCandidate)
@@ -51,6 +52,7 @@ func TestLeaderUpdateTermFromMessage2AA(t *testing.T) {
 // Reference: section 5.1
 func testUpdateTermFromMessage(t *testing.T, state StateType) {
 	r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
 	switch state {
 	case StateFollower:
 		r.becomeFollower(1, 2)
@@ -97,7 +99,6 @@ func TestLeaderBcastBeat2AA(t *testing.T) {
 	for i := 0; i < hi; i++ {
 		r.tick()
 	}
-
 	msgs := r.readMessages()
 	sort.Sort(messageSlice(msgs))
 	wmsgs := []pb.Message{
@@ -136,7 +137,6 @@ func testNonleaderStartElection(t *testing.T, state StateType) {
 	case StateCandidate:
 		r.becomeCandidate()
 	}
-
 	for i := 1; i < 2*et; i++ {
 		r.tick()
 	}
@@ -189,12 +189,10 @@ func TestLeaderElectionInOneRoundRPC2AA(t *testing.T) {
 	}
 	for i, tt := range tests {
 		r := newTestRaft(1, idsBySize(tt.size), 10, 1, NewMemoryStorage())
-
 		r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		for id, vote := range tt.votes {
 			r.Step(pb.Message{From: id, To: 1, Term: r.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: !vote})
 		}
-
 		if r.State != tt.state {
 			t.Errorf("#%d: state = %s, want %s", i, r.State, tt.state)
 		}
@@ -220,13 +218,12 @@ func TestFollowerVote2AA(t *testing.T) {
 		{1, 2, true},
 		{2, 1, true},
 	}
+
 	for i, tt := range tests {
 		r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
 		r.Term = 1
 		r.Vote = tt.vote
-
 		r.Step(pb.Message{From: tt.nvote, To: 1, Term: 1, MsgType: pb.MessageType_MsgRequestVote})
-
 		msgs := r.readMessages()
 		wmsgs := []pb.Message{
 			{From: 1, To: tt.nvote, Term: 1, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: tt.wreject},
@@ -367,7 +364,6 @@ func TestLeaderStartReplication2AB(t *testing.T) {
 	r.becomeLeader()
 	commitNoopEntry(r, s)
 	li := r.RaftLog.LastIndex()
-
 	ents := []*pb.Entry{{Data: []byte("some data")}}
 	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: ents})
 
@@ -416,6 +412,10 @@ func TestLeaderCommitEntry2AB(t *testing.T) {
 	if g := r.RaftLog.committed; g != li+1 {
 		t.Errorf("committed = %d, want %d", g, li+1)
 	}
+	///fmt.Printf("raftlog firstIndex: %d\n", r.RaftLog.FirstIndex())
+	///fmt.Printf("raftlog lastIndex: %d\n", r.RaftLog.LastIndex())
+	///fmt.Printf("raftlog committed: %d\n", r.RaftLog.committed)
+	///fmt.Printf("raftlog applied: %d\n", r.RaftLog.applied)
 	wents := []pb.Entry{{Index: li + 1, Term: 1, Data: []byte("some data")}}
 	if g := r.RaftLog.nextEnts(); !reflect.DeepEqual(g, wents) {
 		t.Errorf("nextEnts = %+v, want %+v", g, wents)
@@ -444,17 +444,18 @@ func TestLeaderAcknowledgeCommit2AB(t *testing.T) {
 		acceptors map[uint64]bool
 		wack      bool
 	}{
-		{1, nil, true},
+		{1, nil, true}, //#0
 		{3, nil, false},
 		{3, map[uint64]bool{2: true}, true},
 		{3, map[uint64]bool{2: true, 3: true}, true},
 		{5, nil, false},
-		{5, map[uint64]bool{2: true}, false},
+		{5, map[uint64]bool{2: true}, false}, //#5
 		{5, map[uint64]bool{2: true, 3: true}, true},
 		{5, map[uint64]bool{2: true, 3: true, 4: true}, true},
 		{5, map[uint64]bool{2: true, 3: true, 4: true, 5: true}, true},
 	}
 	for i, tt := range tests {
+		//fmt.Printf("------START TEST #%d------\n",i)
 		s := NewMemoryStorage()
 		r := newTestRaft(1, idsBySize(tt.size), 10, 1, s)
 		r.becomeCandidate()
@@ -462,7 +463,10 @@ func TestLeaderAcknowledgeCommit2AB(t *testing.T) {
 		commitNoopEntry(r, s)
 		li := r.RaftLog.LastIndex()
 		r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
-
+		//fmt.Printf("li: %d  committed: %d  last: %d\n", li, r.RaftLog.committed, r.RaftLog.LastIndex())
+		//for _, e := range r.RaftLog.entries {
+		//	fmt.Printf("entry: %d  term: %d  data: %s\n", e.Index, e.Term, e.Data)
+		//}
 		for _, m := range r.readMessages() {
 			if tt.acceptors[m.To] {
 				r.Step(acceptAndReply(m))
@@ -587,15 +591,14 @@ func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 		{ents[1].Term + 1, ents[1].Index + 1, true},
 	}
 	for i, tt := range tests {
+		//fmt.Printf("|------ TEST # %d STARTS------|\n", i)
 		storage := NewMemoryStorage()
 		storage.Append(ents)
 		r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, storage)
 		r.RaftLog.committed = 1
 		r.becomeFollower(2, 2)
 		msgs := r.readMessages() // clear message
-
 		r.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: tt.term, Index: tt.index})
-
 		msgs = r.readMessages()
 		if len(msgs) != 1 {
 			t.Errorf("#%d: len(msgs) = %+v, want %+v", i, len(msgs), 1)

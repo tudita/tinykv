@@ -109,6 +109,7 @@ func TestLeaderCycle2AA(t *testing.T) {
 
 		for _, peer := range n.peers {
 			sm := peer.(*Raft)
+			//fmt.Printf("node %d state = %v\n", sm.id, sm.State)
 			if sm.id == campaignerID && sm.State != StateLeader {
 				t.Errorf("campaigning node %d state = %v, want StateLeader",
 					sm.id, sm.State)
@@ -161,7 +162,10 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	if sm1.Term != 2 {
 		t.Errorf("term = %d, want 2", sm1.Term)
 	}
-
+	//for i := range n.peers {
+	//	sm := n.peers[i].(*Raft)
+	//	fmt.Printf("%s %d term is %d\n", sm.State.String(), sm.id, sm.Term)
+	//}
 	// Node 1 campaigns again with a higher term. This time it succeeds.
 	n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	if sm1.State != StateLeader {
@@ -562,10 +566,10 @@ func TestProposal2AB(t *testing.T) {
 }
 
 // TestHandleMessageType_MsgAppend ensures:
-// 1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-// 2. If an existing entry conflicts with a new one (same index but different terms),
-//    delete the existing entry and all that follow it; append any new entries not already in the log.
-// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+//  1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+//  2. If an existing entry conflicts with a new one (same index but different terms),
+//     delete the existing entry and all that follow it; append any new entries not already in the log.
+//  3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	tests := []struct {
 		m       pb.Message
@@ -775,7 +779,6 @@ func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 	if c.State != StateFollower {
 		t.Errorf("state = %s, want %s", c.State, StateFollower)
 	}
-
 	// isolate 3 and increase term in rest
 	nt.isolate(3)
 
