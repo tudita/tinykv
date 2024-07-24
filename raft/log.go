@@ -90,6 +90,18 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	index, err := l.storage.FirstIndex()
+	//FirstIndex 返回可能通过 Entries 方法可用的第一个日志条目的索引（较旧的条目已被合并到最新的快照中
+	if err != nil {
+		panic(err)
+	}
+	if len(l.entries) > 0 {
+		if index > l.LastIndex() {
+			l.entries = nil
+		} else if index >= l.FirstIndex() {
+			l.entries = l.entries[index-l.FirstIndex():]
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.

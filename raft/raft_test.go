@@ -1064,12 +1064,13 @@ func TestProvideSnap2C(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 	sm.readMessages() // clear message
-
 	// force set the next of node 2 to less than the SnapshotMetadata.Index, so that node 2 needs a snapshot
 	sm.Prs[2].Next = 10
 	sm.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("somedata")}}})
 
 	msgs := sm.readMessages()
+	//fmt.Print(msgs)
+	//fmt.Printf("\nlen(mgs)%d\n", len(msgs))
 	if len(msgs) != 1 {
 		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
 	}

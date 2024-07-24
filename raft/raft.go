@@ -171,12 +171,18 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	if c.peers == nil {
+		c.peers = confState.Nodes
+	}
 	prs := make(map[uint64]*Progress)
 	for _, peer := range c.peers {
-		prs[peer] = new(Progress)
+		prs[peer] = &Progress{Next: 0, Match: 0}
 	}
-	hardState, _, _ := c.Storage.InitialState()
-	return &Raft{
+	raft := Raft{
 		RaftLog:             newLog(c.Storage),
 		id:                  c.ID,
 		Prs:                 prs,
@@ -188,6 +194,10 @@ func newRaft(c *Config) *Raft {
 		Vote:                hardState.Vote,
 		Term:                hardState.Term,
 	}
+	if c.Applied > 0 {
+		raft.RaftLog.appliedTo(c.Applied)
+	}
+	return &raft
 	//利用config中的信息初始化raft结构体
 	//还要用到hardState
 }
@@ -220,7 +230,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 	firstIndex := r.RaftLog.FirstIndex()
+	if r.RaftLog.FirstIndex()-1 >= pr.Next { //要发的entry已经被压缩
+		r.sendSnapshot(to)
+		return false
+		//把发送快照作为发送失误？
+	}
 	for i := pr.Next; i <= r.RaftLog.LastIndex(); i++ {
+		//fmt.Printf("i:%d firstIndex:%d\n", i, firstIndex)
 		ents = append(ents, &r.RaftLog.entries[i-firstIndex])
 	}
 
@@ -240,6 +256,29 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	return true
 	//什么情况下会sent失败？
+}
+
+func (r *Raft) sendSnapshot(to uint64) {
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+	}
+	if err != nil {
+		//这是什么情况
+		return
+	}
+	msg := pb.Message{
+		MsgType:  eraftpb.MessageType_MsgSnapshot,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -278,6 +317,7 @@ func (r *Raft) sendAppend2All() {
 		cnt++
 		if pr != r.id {
 			r.sendAppend(pr)
+
 		}
 	}
 	r.updateCommited()
@@ -423,6 +463,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleRequestVote(m)
 		case eraftpb.MessageType_MsgRequestVoteResponse:
 		case eraftpb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		case eraftpb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
 		case eraftpb.MessageType_MsgHeartbeatResponse:
@@ -464,6 +505,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 
 		case eraftpb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		case eraftpb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
 		case eraftpb.MessageType_MsgHeartbeatResponse:
@@ -488,6 +530,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleRequestVote(m)
 		case eraftpb.MessageType_MsgRequestVoteResponse:
 		case eraftpb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		case eraftpb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
 		case eraftpb.MessageType_MsgHeartbeatResponse:
@@ -504,7 +547,9 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		r.becomeFollower(m.Term, None)
 	}
 	if m.Reject {
+		//fmt.Printf("Form (%d, %d)", r.Prs[m.From].Next-1, m.Index+1)
 		r.Prs[m.From].Next = min(r.Prs[m.From].Next-1, m.Index+1)
+		//fmt.Printf(" Reject: nextTo %d\n", r.Prs[m.From].Next)
 		r.sendAppend(m.From)
 		return //拒绝则重发
 	}
@@ -535,16 +580,19 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	if m.Term < r.Term {
 		response.Reject = true
+		response.Index = r.RaftLog.LastIndex()
 		r.msgs = append(r.msgs, response)
 		return
 	}
 
 	if m.Index > r.RaftLog.LastIndex() {
 		response.Reject = true
+		response.Index = r.RaftLog.LastIndex()
 		r.msgs = append(r.msgs, response)
 		return
 	} else if t, _ := r.RaftLog.Term(m.Index); t != m.LogTerm {
 		response.Reject = true
+		response.Index = r.RaftLog.LastIndex()
 		r.msgs = append(r.msgs, response)
 		return
 	}
@@ -675,6 +723,56 @@ func (r *Raft) handlePropose(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+
+	if r.Term <= m.Term {
+		r.becomeFollower(m.Term, m.From)
+	}
+	if m.Term < r.Term {
+		return
+	}
+	metaData := m.Snapshot.Metadata
+	if metaData.Index <= r.RaftLog.committed || metaData.Index < r.RaftLog.FirstIndex() {
+		return
+	}
+	//压缩的就可以删掉了
+	if len(r.RaftLog.entries) > 0 {
+		if metaData.Index >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[metaData.Index-r.RaftLog.FirstIndex()+1:]
+		}
+
+	}
+	r.RaftLog.applied = metaData.Index
+	r.RaftLog.committed = metaData.Index
+	r.RaftLog.stabled = metaData.Index
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	if metaData.ConfState != nil {
+		r.Prs = make(map[uint64]*Progress)
+		r.votes = make(map[uint64]bool)
+		for _, id := range metaData.ConfState.Nodes {
+			r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+			r.votes[id] = false
+		}
+	}
+	if r.RaftLog.LastIndex() < metaData.Index {
+		r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+			EntryType: pb.EntryType_EntryNormal,
+			Term:      metaData.Index,
+			Index:     metaData.Index,
+		})
+		//查term和index可以顺这个log查
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: eraftpb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  false,
+		Index:   metaData.Index,
+	}) //为了让他回去更新Prs
+
 }
 
 // addNode add a new node to raft group

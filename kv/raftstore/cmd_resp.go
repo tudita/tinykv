@@ -15,7 +15,7 @@ func ensureRespHeader(resp *raft_cmdpb.RaftCmdResponse) {
 
 func BindRespTerm(resp *raft_cmdpb.RaftCmdResponse, term uint64) {
 	if term == 0 {
-		return
+		return  
 	}
 	ensureRespHeader(resp)
 	resp.Header.CurrentTerm = term
