@@ -8,6 +8,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -195,9 +196,6 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 			return response, nil
 		}
 		if lock.Ts != txn.StartTS {
-			response.Error = &kvrpcpb.KeyError{
-				Retryable: "true",
-			}
 			return response, nil
 		}
 	}
@@ -219,22 +217,226 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	response := &kvrpcpb.ScanResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	txn := mvcc.NewMvccTxn(reader, req.GetVersion())
+	if err != nil {
+		return response, err
+	}
+	scan := mvcc.NewScanner(req.StartKey, txn)
+	defer scan.Close()
+	for i := 0; i < int(req.GetLimit()); i++ {
+		if !scan.Valid() {
+			break
+		}
+		key, value, err := scan.Next()
+		if err != nil {
+			return response, err
+		}
+		if key == nil {
+			continue
+		}
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			return response, err
+		}
+		if lock != nil && lock.Ts < txn.StartTS {
+			response.Pairs = append(response.Pairs, &kvrpcpb.KvPair{
+				Error: &kvrpcpb.KeyError{
+					Locked: &kvrpcpb.LockInfo{
+						PrimaryLock: lock.Primary,
+						LockVersion: lock.Ts,
+						Key:         key,
+						LockTtl:     lock.Ttl,
+					},
+				},
+			})
+			continue
+		}
+		if value != nil {
+			response.Pairs = append(response.Pairs, &kvrpcpb.KvPair{
+				Key:   key,
+				Value: value})
+		}
+	}
+	return response, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+
+	response := &kvrpcpb.CheckTxnStatusResponse{Action: kvrpcpb.Action_NoAction}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+	txn := mvcc.NewMvccTxn(reader, req.GetLockTs())
+	write, commitTs, err := txn.CurrentWrite(req.PrimaryKey)
+	if err != nil {
+		return response, err
+	}
+	if write != nil && write.Kind != mvcc.WriteKindRollback {
+		//已经commit
+		response.CommitVersion = commitTs
+		response.Action = kvrpcpb.Action_NoAction
+		return response, nil
+	}
+	lock, err := txn.GetLock(req.PrimaryKey)
+	if err != nil {
+		return response, err
+	}
+	//没commit
+	if lock == nil { //被回滚了但是没记录
+		if write != nil && write.Kind == mvcc.WriteKindRollback {
+			response.Action = kvrpcpb.Action_NoAction
+			response.CommitVersion = 0
+			response.LockTtl = 0
+			return response, nil
+		} else {
+			txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			txn.DeleteValue(req.PrimaryKey)
+			err := server.storage.Write(req.Context, txn.Writes())
+			if err != nil {
+				return response, err
+			}
+			response.Action = kvrpcpb.Action_LockNotExistRollback
+			response.CommitVersion = 0
+			response.LockTtl = 0
+			return response, nil
+		}
+	} else if mvcc.PhysicalTime(lock.Ts)+lock.Ttl <= mvcc.PhysicalTime(req.CurrentTs) {
+		//lock过期了
+		//fmt.Printf("lock.ttl:%d\n", lock.Ttl)
+		//fmt.Printf("lock.ts:%d\n", lock.Ts)
+		//fmt.Printf("current.ts:%d\n", req.CurrentTs)
+		txn.DeleteLock(req.PrimaryKey)
+		txn.DeleteValue(req.PrimaryKey)
+		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+			StartTS: req.LockTs,
+			Kind:    mvcc.WriteKindRollback,
+		})
+		err := server.storage.Write(req.Context, txn.Writes())
+		if err != nil {
+			return response, err
+		}
+		response.Action = 1
+		response.CommitVersion = 0
+		response.LockTtl = 0
+		return response, nil
+
+	}
+	response.LockTtl = lock.Ttl
+	return response, nil
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+
+	response := &kvrpcpb.BatchRollbackResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	for _, key := range req.Keys {
+
+		write, _, err := txn.CurrentWrite(key)
+		if err != nil {
+			return response, err
+		}
+		//已经回滚了
+		if write != nil && write.Kind == mvcc.WriteKindRollback {
+			continue
+		}
+		//已经commit了
+		if write != nil && write.Kind != mvcc.WriteKindRollback {
+			response.Error = &kvrpcpb.KeyError{
+				Abort: "true",
+			}
+			return response, nil
+		}
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			return response, err
+		}
+
+		if lock != nil && lock.Ts != txn.StartTS { //该key被其他事务的lock锁住,中止操作,可以以后重试
+			//依然要给回滚标记
+			txn.PutWrite(key, txn.StartTS, &mvcc.Write{
+				StartTS: txn.StartTS,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			continue
+		}
+
+		txn.DeleteLock(key)
+		txn.DeleteValue(key)
+		txn.PutWrite(key, txn.StartTS, &mvcc.Write{
+			StartTS: txn.StartTS,
+			Kind:    mvcc.WriteKindRollback,
+		})
+	}
+	err = server.storage.Write(req.Context, txn.Writes())
+
+	if err != nil {
+		return response, err
+	}
+	return response, nil
 }
 
+// 处理StartVersion这个事务(时间戳唯一标识一个事务)的的锁冲突情况,commit or rollback
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+
+	var keys [][]byte
+	response := &kvrpcpb.ResolveLockResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	iter := txn.Reader.IterCF(engine_util.CfLock)
+	for ; iter.Valid(); iter.Next() {
+		//为什么要满足时间戳相等
+		item := iter.Item()
+		key := item.KeyCopy(nil)
+		val, err := item.ValueCopy(nil)
+		if err != nil {
+			return response, err
+		}
+		lock, err := mvcc.ParseLock(val)
+		if err != nil {
+			return response, err
+		}
+		if lock.Ts == txn.StartTS {
+			//lock存储的key不附带时间戳
+			keys = append(keys, key)
+		}
+	}
+	if req.GetCommitVersion() == 0 {
+		//primaryKey滚了,应该全部回滚
+		res, err := server.KvBatchRollback(context.Background(), &kvrpcpb.BatchRollbackRequest{StartVersion: req.StartVersion, Keys: keys, Context: req.Context})
+		if err != nil {
+			return response, err
+		}
+		response.Error = res.Error
+		response.RegionError = res.RegionError
+		return response, nil
+	} else {
+		//提交了,那就提交
+		res, err := server.KvCommit(context.Background(), &kvrpcpb.CommitRequest{StartVersion: req.StartVersion, Keys: keys, Context: req.Context, CommitVersion: req.GetCommitVersion()})
+		if err != nil {
+			return response, err
+		}
+		response.Error = res.Error
+		response.RegionError = res.RegionError
+		return response, nil
+	}
 }
 
 // SQL push down commands.

@@ -20,8 +20,7 @@ func (ke *KeyError) Error() string {
 	return ke.String()
 }
 
-// MvccTxn groups together writes as part of a single transaction. It also provides an abstraction over low-level
-// storage, lowering the concepts of timestamps, writes, and locks into plain keys and values.
+
 type MvccTxn struct {
 	StartTS uint64
 	Reader  storage.StorageReader
