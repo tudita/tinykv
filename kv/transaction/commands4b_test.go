@@ -540,7 +540,6 @@ func TestCommitConflictRace4B(t *testing.T) {
 		{cf: engine_util.CfLock, key: []byte{3}, value: []byte{1, 3, 0, 0, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0}},
 	})
 	resp := builder.runOneRequest(cmd).(*kvrpcpb.CommitResponse)
-
 	assert.NotEmpty(t, resp.Error.Retryable)
 	assert.Nil(t, resp.RegionError)
 	builder.assertLens(1, 1, 0)

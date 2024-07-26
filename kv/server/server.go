@@ -174,6 +174,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 		return response, err
 	}
 	txn := mvcc.NewMvccTxn(reader, req.GetStartVersion())
+
 	for _, key := range keys {
 		lock, err := txn.GetLock(key)
 		if err != nil {
@@ -196,6 +197,9 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 			return response, nil
 		}
 		if lock.Ts != txn.StartTS {
+			response.Error = &kvrpcpb.KeyError{
+				Retryable: "true",
+			}
 			return response, nil
 		}
 	}
