@@ -1306,6 +1306,7 @@ func TestLeaderTransferToUpToDateNode3A(t *testing.T) {
 // is sent to the leader, in this test case every leader transfer message is sent
 // to the follower.
 func TestLeaderTransferToUpToDateNodeFromFollower3A(t *testing.T) {
+	//after transferring, node has state StateLeader lead 1, want state StateFollower lead 2
 	nt := newNetwork(nil, nil, nil)
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 

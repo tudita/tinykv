@@ -202,6 +202,7 @@ func newRaft(c *Config) *Raft {
 	//还要用到hardState
 }
 func (r *Raft) reset() {
+	r.leadTransferee = None
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.Vote = None
@@ -210,9 +211,10 @@ func (r *Raft) reset() {
 func (r *Raft) append(entries []*pb.Entry) {
 	for i, entry := range entries {
 		ent := pb.Entry{
-			Term:  r.Term,
-			Index: r.RaftLog.LastIndex() + 1 + uint64(i),
-			Data:  entry.Data,
+			EntryType: entry.EntryType,
+			Term:      r.Term,
+			Index:     r.RaftLog.LastIndex() + 1 + uint64(i),
+			Data:      entry.Data,
 		}
 		r.RaftLog.entries = append(r.RaftLog.entries, ent)
 	}
@@ -360,6 +362,11 @@ func (r *Raft) tick() {
 			r.sendHeartbeat2All()
 		}
 		//leader宕机后变为follower或许应该在异步接受到heartbeat后处理？
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			r.leadTransferee = None
+			//对面可能宕机了,重置leadTransferee
+		}
 	}
 	if r.State == StateFollower {
 		if r.electionElapsed >= r.electionTimeout {
@@ -420,13 +427,15 @@ func (r *Raft) becomeLeader() {
 		//nextindex初始化为领导人最后的日志条目索引+1
 		//matchindex为已知的已经复制到该服务器的最高日志条目的索引,初始值为0
 	}
-	//明明要求新leader要附加一个noop entry，但是我注释掉这一行之后反而pass掉了？
 	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 	//r.updateCommited()
 }
 func (r *Raft) elect() {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	//fmt.Printf("%s %d start elect The term is %d \n", r.State.String(), r.id, r.Term)
 	r.RandomizeTimeout()
 	r.becomeCandidate()
@@ -468,7 +477,12 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleHeartbeat(m)
 		case eraftpb.MessageType_MsgHeartbeatResponse:
 		case eraftpb.MessageType_MsgTransferLeader:
+			if r.Lead != None {
+				m.To = r.Lead
+				r.msgs = append(r.msgs, m)
+			}
 		case eraftpb.MessageType_MsgTimeoutNow:
+			r.handleTimeoutNow()
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -511,6 +525,7 @@ func (r *Raft) Step(m pb.Message) error {
 		case eraftpb.MessageType_MsgHeartbeatResponse:
 		case eraftpb.MessageType_MsgTransferLeader:
 		case eraftpb.MessageType_MsgTimeoutNow:
+			r.handleTimeoutNow()
 		}
 	case StateLeader:
 		if m.Term > r.Term {
@@ -536,12 +551,37 @@ func (r *Raft) Step(m pb.Message) error {
 		case eraftpb.MessageType_MsgHeartbeatResponse:
 			r.handleHeartbeatResponse(m)
 		case eraftpb.MessageType_MsgTransferLeader:
+			r.handleTransferLeader(m)
 		case eraftpb.MessageType_MsgTimeoutNow:
+			r.handleTimeoutNow()
 		}
 	}
 	return nil
 }
+func (r *Raft) handleTransferLeader(m pb.Message) {
 
+	if r.State != StateLeader {
+		fmt.Printf("Node %d is not leader\n", r.id)
+		return
+	}
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+	//leadTransferee is id of the leader transfer target when its value is not zero.
+	//Follow the procedure defined in section 3.10 of Raft phd thesis
+	r.leadTransferee = m.From
+	if r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+
+		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: r.leadTransferee})
+	} else {
+
+		r.sendAppend(r.leadTransferee)
+	}
+}
+func (r *Raft) handleTimeoutNow() {
+	r.electionElapsed = 0
+	r.elect()
+}
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	if r.Term < m.Term {
 		r.becomeFollower(m.Term, None)
@@ -559,6 +599,11 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	if r.updateCommited() {
 		r.sendAppend2All()
 	}
+	//added in (3A) leaderTransfer循环,发出append请求后重新请求leaderTransfer
+	if r.leadTransferee == m.From {
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: r.leadTransferee})
+	}
+
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -695,6 +740,9 @@ func (r *Raft) updateCommited() bool {
 	sort.Slice(match, func(i, j int) bool { //    1 2 3 4 5 6
 		return match[i] < match[j] //小的在前面   1 2 3 4 5 6 7
 	})
+	if len(r.Prs) == 0 {
+		return false
+	}
 	majority := match[(len(r.Prs)-1)/2]
 	for ; majority > r.RaftLog.committed; majority-- {
 		if term, _ := r.RaftLog.Term(majority); term == r.Term {
@@ -716,6 +764,9 @@ func (r *Raft) updateCommited() bool {
 }
 
 func (r *Raft) handlePropose(m pb.Message) {
+	if r.leadTransferee != None {
+		return
+	}
 	r.append(m.Entries)
 	r.sendAppend2All()
 }
@@ -778,9 +829,23 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+		r.votes[id] = false
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		delete(r.votes, id)
+	} else {
+		return
+	}
+	//删除后可能原本commit不占多数了
+	if r.updateCommited() {
+		r.sendAppend2All()
+	}
 }

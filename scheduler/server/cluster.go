@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/schedulerpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/logutil"
@@ -279,7 +280,40 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
-
+	metaRegion := region.GetMeta()
+	if metaRegion == nil {
+		return ErrRegionNotFound(region.GetID())
+	}
+	oldRegion := c.GetRegion(metaRegion.Id)
+	if oldRegion != nil { //有相同Id的region
+		if metaRegion.GetRegionEpoch() == nil || oldRegion.GetRegionEpoch() == nil {
+			//return errors.Errorf("region epoch is nil")
+			return nil
+			//我不知道这算什么情况
+		}
+		if util.IsEpochStale(metaRegion.GetRegionEpoch(), oldRegion.GetRegionEpoch()) {
+			return ErrRegionIsStale(metaRegion, oldRegion.GetMeta())
+		}
+	} else {
+		regions := c.ScanRegions(metaRegion.StartKey, metaRegion.EndKey, defaultChangedRegionsLimit)
+		for _, reg := range regions {
+			if metaRegion.GetRegionEpoch() == nil || reg.GetRegionEpoch() == nil {
+				//return errors.Errorf("region epoch is nil")
+				return nil
+				//我不知道这算什么情况
+			}
+			if util.IsEpochStale(metaRegion.GetRegionEpoch(), reg.GetRegionEpoch()) {
+				return ErrRegionIsStale(metaRegion, reg.GetMeta())
+			}
+		}
+	}
+	err := c.putRegion(region)
+	if err != nil {
+		return err
+	}
+	for _, store := range c.GetStores() {
+		c.updateStoreStatusLocked(store.GetID())
+	}
 	return nil
 }
 
