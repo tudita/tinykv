@@ -1,7 +1,7 @@
 #!/bin/bash
-for ((i=1;i<=50;i++));
+for ((i=4;i<=10;i++));
 do
 	echo "ROUND $i";
-	make project3a > ./out/out-$i.txt;
+	make project3b > ./out/out-$i.txt;
 done
 

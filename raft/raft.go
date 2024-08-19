@@ -21,6 +21,8 @@ import (
 	"math/big"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -163,6 +165,8 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex    uint64
 	electionTimeoutbase int
+
+	heartbeatResp map[uint64]bool
 }
 
 // newRaft return a raft peer with the given config
@@ -193,6 +197,9 @@ func newRaft(c *Config) *Raft {
 		votes:               make(map[uint64]bool),
 		Vote:                hardState.Vote,
 		Term:                hardState.Term,
+		Lead:                None,
+		leadTransferee:      0,
+		heartbeatResp:       make(map[uint64]bool),
 	}
 	if c.Applied > 0 {
 		raft.RaftLog.appliedTo(c.Applied)
@@ -207,6 +214,8 @@ func (r *Raft) reset() {
 	r.heartbeatElapsed = 0
 	r.Vote = None
 	r.votes = make(map[uint64]bool)
+	r.heartbeatResp = make(map[uint64]bool)
+	r.heartbeatResp[r.id] = true
 }
 func (r *Raft) append(entries []*pb.Entry) {
 	for i, entry := range entries {
@@ -231,8 +240,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if !ok {
 		return false
 	}
+	prevLogIndex := pr.Next - 1
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	firstIndex := r.RaftLog.FirstIndex()
-	if r.RaftLog.FirstIndex()-1 >= pr.Next { //要发的entry已经被压缩
+	if err != nil || r.RaftLog.FirstIndex()-1 >= pr.Next { //要发的entry已经被压缩
 		r.sendSnapshot(to)
 		return false
 		//把发送快照作为发送失误？
@@ -242,8 +253,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 		ents = append(ents, &r.RaftLog.entries[i-firstIndex])
 	}
 
-	prevLogIndex := pr.Next - 1
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	message := eraftpb.Message{
 		MsgType: eraftpb.MessageType_MsgAppend,
 		To:      to,
@@ -289,9 +298,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	message := eraftpb.Message{
 		MsgType: eraftpb.MessageType_MsgHeartbeat,
 		To:      to,
-		From:    r.id,                //发送者ID(leader)
-		Term:    r.Term,              //发送者任期(leader)
-		Commit:  r.RaftLog.committed, //current commit index
+		From:    r.id,                  //发送者ID(leader)
+		Term:    r.Term,                //发送者任期(leader)
+		Commit:  util.RaftInvalidIndex, //current commit index
 	}
 	r.msgs = append(r.msgs, message)
 }
@@ -354,8 +363,14 @@ func (r *Raft) tick() {
 	//electionElapsed无论对谁都有效。对于leader和candidate,每间隔一个electionTimeout就清空
 	//对于follower,如果收到了leader的消息就清空,否则,若达到了electionTimeout,说明leader寄了,转化为candidate参与选举
 	//此时记得重置elctionTimeout
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+
 	r.electionElapsed++
 	if r.State == StateLeader { //若为领导人，发送heartbeat
+		heartbeatnum := len(r.heartbeatResp)
+
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
@@ -364,8 +379,15 @@ func (r *Raft) tick() {
 		//leader宕机后变为follower或许应该在异步接受到heartbeat后处理？
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
-			r.leadTransferee = None
-			//对面可能宕机了,重置leadTransferee
+			r.heartbeatResp = make(map[uint64]bool)
+			r.heartbeatResp[r.id] = true
+			if heartbeatnum*2 <= len(r.Prs) {
+				r.elect()
+			}
+			// leader 转移失败，目标节点可能挂了，放弃转移
+			if r.leadTransferee != None {
+				r.leadTransferee = None
+			}
 		}
 	}
 	if r.State == StateFollower {
@@ -453,6 +475,10 @@ func (r *Raft) elect() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if _, ok := r.Prs[r.id]; !ok && len(r.Prs) != 0 {
+		log.Infof("%d do not exist and have other peers return, term %d, Prs %+v\n", r.id, r.Term, r.Prs)
+		return nil
+	}
 	if m.Term > r.Term {
 		r.Vote = None
 		r.becomeFollower(m.Term, None)
@@ -691,6 +717,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	r.msgs = append(r.msgs, response)
 }
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	r.heartbeatResp[m.From] = true
 	if m.Commit < r.RaftLog.committed {
 		r.sendAppend(m.From)
 	}
@@ -767,8 +794,21 @@ func (r *Raft) handlePropose(m pb.Message) {
 	if r.leadTransferee != None {
 		return
 	}
+	lastIndex := r.RaftLog.LastIndex()
+	for i, entry := range m.Entries {
+		// 3A: conf change confirm
+		if entry.EntryType == pb.EntryType_EntryConfChange {
+			if r.PendingConfIndex > r.RaftLog.applied {
+				return
+			}
+			r.PendingConfIndex = lastIndex + uint64(i) + 1
+		}
+	}
 	r.append(m.Entries)
 	r.sendAppend2All()
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.Prs[r.id].Match
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -830,7 +870,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
 	if _, ok := r.Prs[id]; !ok {
-		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+		r.Prs[id] = &Progress{Next: 0, Match: 0}
 		r.votes[id] = false
 	}
 }

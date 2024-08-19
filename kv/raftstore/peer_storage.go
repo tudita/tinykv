@@ -354,7 +354,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 	if ps.isInitialized() {
 		if err := ps.clearMeta(kvWB, raftWB); err != nil {
-			panic(err)
+			log.Panic(err)
 			return nil, err
 		}
 		ps.clearExtraData(snapData.Region)
